@@ -1,4 +1,1 @@
-opencv-python
-pillow
-pytesseract
-numpy
+# The conservative UIAutomator bridge uses only the Python standard library.

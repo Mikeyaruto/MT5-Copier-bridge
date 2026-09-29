@@ -1,73 +1,28 @@
-# PU Prime Android Emulator Bridge (Windows)
+# PU Prime emulator position reader
 
-## 1) Install prerequisites
+This program observes the **open positions screen** of a signed-in PU Prime Android emulator using ADB UIAutomator. It does not log in or collect a password. It writes `C:\bridge\events.jsonl`, which is the input to the companion [MT5-Copier](https://github.com/Mikeyaruto/MT5-Copier) project. Both Python programs must run on the same Windows machine or share this file reliably.
 
-1. **Python 3.10+** (64-bit) from https://www.python.org/downloads/windows/
-   - During install, check **Add Python to PATH**.
-2. **Android Platform Tools (ADB)** from Google:
-   - https://developer.android.com/tools/releases/platform-tools
-   - Extract (example): `C:\Android\platform-tools`
-3. **Tesseract OCR** (optional fallback, recommended):
-   - Install from https://github.com/UB-Mannheim/tesseract/wiki
-   - Add Tesseract install folder to PATH (for example `C:\Program Files\Tesseract-OCR`).
+## Setup
 
-## 2) Prepare emulator ADB
+1. Install Python 3.10+ and Android Platform Tools; make `adb` available on `PATH`.
+2. Start the emulator, open PU Prime's **Positions** page, and verify `adb devices` reports one connected device.
+3. In this repository, run `python main.py`. The first two valid snapshots establish a baseline; existing trades are **not** copied.
+4. Start `python run_bridge.py` from the MT5-Copier repository. Its `config.yaml` feed path defaults to `C:/bridge/events.jsonl`. Follow that repository's `setup.md` for EA installation.
+5. On an MT5 **demo account**, compile and attach the EA, then deliberately set `EnableExecution=true` with a small `MaxLots` cap. Check the MT5 account number and mapped broker symbols before creating a small source trade.
 
-1. Start your Android emulator (BlueStacks/LDPlayer/Nox/MEmu, etc).
-2. Enable ADB in emulator settings.
-3. In PowerShell/CMD:
-   ```powershell
-   adb devices
-   ```
-   You should see one device in `device` state.
+This reader intentionally does not interpret a missing or unrecognised screen as closed positions. It needs a visible `Positions` label and an explicit `No open positions` label for an empty list. Rows need a recognised symbol, BUY/SELL, and a volume labelled `lot`, `lots`, `vol`, or `volume`. If your actual app uses different wording, set `POSITION_SCREEN_MARKER`, `EMPTY_POSITION_MARKER`, and `SOURCE_SYMBOLS` as needed. **Check the XML structure with a demo account before relying on this reader.** It does not automate navigation, interpret trades off-screen, or guarantee the UI contains ticket IDs.
 
-> If `adb` is not recognized, add your platform-tools directory to PATH or run with full path.
-
-## 3) Install Python dependencies
-
-In project folder:
+For example, in PowerShell:
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-## 4) Run the bridge
-
-```powershell
+$env:SOURCE_SYMBOLS="XAUUSD,EURUSD,GBPUSD,USDJPY"
+$env:POSITION_SCREEN_MARKER="Positions"
+$env:EMPTY_POSITION_MARKER="No open positions"
 python main.py
 ```
 
-The script will create:
+`ADB_PATH`, `POLL_SECONDS` (default 1.5), `CONFIRM_POLLS` (minimum 2), `BRIDGE_DIR`, and `EVENTS_PATH` are also configurable. Keep the state file and JSONL file together with regular backups. Do not clear `source_state.json`, `events.jsonl`, or its `.offset` file during operation; recovering or resynchronising requires checking source positions against MT5 positions first.
 
-- `C:\bridge\signal.json`
-- `C:\bridge\bridge.log`
+Each line contains a distinct, replay-safe event with `event_id`, `event`, `source`, `source_trade_id`, `symbol`, `side`, `lots`, `sl`, `tp`, and `timestamp`. Source trade IDs use visible ticket IDs if available, otherwise an assigned identity retained in `source_state.json`. With identical positions and no visible ticket ID, a close can be assigned to either equal position. Do not use this design for partial closes or position edits until the actual UI provides the required identifiers and update events.
 
-## 5) Signal format
-
-OPEN example:
-```json
-{"action":"OPEN","symbol":"XAUUSD","side":"BUY","lot":0.1}
-```
-
-CLOSE example:
-```json
-{"action":"CLOSE","symbol":"XAUUSD"}
-```
-
-## 6) Notes / tuning
-
-- The primary parser uses **ADB UIAutomator XML** from current screen.
-- If no trades are detected from XML, it falls back to screenshot OCR.
-- If your emulator uses a custom ADB path:
-  ```powershell
-  set ADB_PATH=C:\Android\platform-tools\adb.exe
-  python main.py
-  ```
-- Polling interval default is 1.5s, can be changed:
-  ```powershell
-  set POLL_SECONDS=1.0
-  python main.py
-  ```
-
+If the page cannot be parsed, the reader logs an invalid snapshot in `C:\bridge\bridge.log` and emits no action. Validate a real PU Prime XML capture before going beyond the demo test. No screenshot OCR is attempted; uncertain OCR readings are unsafe for automatic orders.
