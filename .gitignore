@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+events.jsonl
+*.offset
+source_state.json
+bridge.log
+*.tmp

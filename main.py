@@ -1,37 +1,37 @@
+"""Conservative, durable source position reader for MT5-Copier.
+
+Validate UI selectors on the user's actual PU Prime positions screen before use.
+"""
 import json
 import logging
 import os
 import re
 import subprocess
-import tempfile
 import time
+import uuid
 import xml.etree.ElementTree as ET
-from collections import Counter
-from dataclasses import dataclass
+from collections import defaultdict, deque
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
-
-try:
-    import cv2  # noqa: F401  # imported for fallback pipeline readiness
-    import numpy as np  # noqa: F401
-    from PIL import Image
-    import pytesseract
-except Exception:
-    # OCR fallback stays optional; UIAutomator path is primary.
-    pytesseract = None
+from typing import List, Optional
 
 ADB_PATH = os.environ.get("ADB_PATH", "adb")
 POLL_SECONDS = float(os.environ.get("POLL_SECONDS", "1.5"))
+CONFIRM_POLLS = max(2, int(os.environ.get("CONFIRM_POLLS", "2")))
+SCREEN_MARKER = os.environ.get("POSITION_SCREEN_MARKER", "Positions").casefold()
+EMPTY_MARKER = os.environ.get("EMPTY_POSITION_MARKER", "No open positions").casefold()
+BRIDGE_DIR = Path(os.environ.get("BRIDGE_DIR", r"C:\bridge"))
+EVENTS_PATH = Path(os.environ.get("EVENTS_PATH", str(BRIDGE_DIR / "events.jsonl")))
+STATE_PATH = BRIDGE_DIR / "source_state.json"
+LOG_PATH = BRIDGE_DIR / "bridge.log"
 ANDROID_DUMP_PATH = "/sdcard/window_dump.xml"
 
-BRIDGE_DIR = Path(r"C:\bridge")
-SIGNAL_PATH = BRIDGE_DIR / "signal.json"
-LOG_PATH = BRIDGE_DIR / "bridge.log"
-
-# Tune this to what appears in PU Prime UI.
-SYMBOL_PATTERN = re.compile(r"\b([A-Z]{3,7}(?:USD|JPY|EUR|GBP|AUD|NZD|CHF|CAD)?)\b")
-LOT_PATTERN = re.compile(r"(?:lot|volume|vol)?\s*[:=]?\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
-SIDE_PATTERN = re.compile(r"\b(BUY|SELL)\b", re.IGNORECASE)
+SYMBOL_RE = re.compile(r"\b([A-Z]{3,12}(?:\.[A-Z0-9]+)?)\b")
+SIDE_RE = re.compile(r"\b(BUY|SELL)\b", re.I)
+LOT_RE = re.compile(r"\b(?:lots?|volume|vol)\s*[:=]?\s*(\d+(?:\.\d+)?)\b", re.I)
+TICKET_RE = re.compile(r"\b(?:ticket|position\s*id|order\s*id|#)\s*[:#]?\s*(\d{5,})\b", re.I)
+RESERVED = {"BUY", "SELL", "POSITION", "POSITIONS", "VOLUME", "LOT", "LOTS", "PRICE", "PROFIT", "LOSS"}
 
 
 @dataclass(frozen=True)
@@ -39,195 +39,185 @@ class Position:
     symbol: str
     side: str
     lot: float
+    ticket: Optional[str] = None
 
 
 class SignalBridge:
-    def __init__(self) -> None:
+    def __init__(self):
         BRIDGE_DIR.mkdir(parents=True, exist_ok=True)
-        logging.basicConfig(
-            filename=str(LOG_PATH),
-            level=logging.INFO,
-            format="%(asctime)s [%(levelname)s] %(message)s",
-        )
-        self.prev_positions: Counter = Counter()
-        self.recent_signals: Dict[str, float] = {}
-        self.recent_ttl_seconds = 5.0
+        EVENTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        logging.basicConfig(filename=str(LOG_PATH), level=logging.INFO,
+                            format="%(asctime)s [%(levelname)s] %(message)s")
+        self._repair_partial_tail()
+        self.state = self._load_state()
+        if self.state is None and EVENTS_PATH.exists() and EVENTS_PATH.stat().st_size:
+            raise RuntimeError("Source state is missing while events exist; reconcile before restarting")
+        self.candidate = None
+        self.candidate_count = 0
 
-    def run(self) -> None:
-        logging.info("Starting bridge monitor.")
-        self._ensure_adb_connected()
+    def _repair_partial_tail(self):
+        if not EVENTS_PATH.exists():
+            return
+        with EVENTS_PATH.open("rb+") as handle:
+            content = handle.read()
+            if content and not content.endswith(b"\n"):
+                last_line = content[content.rfind(b"\n") + 1:]
+                try:
+                    json.loads(last_line)
+                except (ValueError, UnicodeDecodeError):
+                    handle.truncate(content.rfind(b"\n") + 1)
+                    logging.warning("Removed incomplete trailing event")
+                else:
+                    handle.seek(0, os.SEEK_END)
+                    handle.write(b"\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
 
+    def _load_state(self):
+        if not STATE_PATH.exists():
+            return None
+        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+
+    def _save_state(self, state):
+        temp = STATE_PATH.with_suffix(".tmp")
+        with temp.open("w", encoding="utf-8") as handle:
+            json.dump(state, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, STATE_PATH)
+
+    def _run_adb(self, args):
+        return subprocess.run([ADB_PATH, *args], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=15, check=False)
+
+    def _read_live_positions(self) -> List[Position]:
+        proc = self._run_adb(["shell", "uiautomator", "dump", ANDROID_DUMP_PATH])
+        if proc.returncode:
+            raise RuntimeError(f"UI dump failed: {proc.stderr.strip()}")
+        proc = self._run_adb(["exec-out", "cat", ANDROID_DUMP_PATH])
+        if proc.returncode or "<hierarchy" not in proc.stdout:
+            raise RuntimeError("UI hierarchy unavailable")
+        return self._extract_positions_from_xml(proc.stdout)
+
+    def _extract_single_record(self, text):
+        side = SIDE_RE.search(text)
+        lot = LOT_RE.search(text)
+        allowed = {s.strip() for s in os.environ.get(
+            "SOURCE_SYMBOLS", "XAUUSD,EURUSD,GBPUSD,USDJPY").upper().split(",")}
+        symbols = [w.group(1) for w in SYMBOL_RE.finditer(text.upper())
+                   if w.group(1) not in RESERVED and w.group(1) in allowed]
+        if not (side and lot and len(set(symbols)) == 1):
+            return None
+        volume = float(lot.group(1))
+        if not 0 < volume <= 100:
+            return None
+        ticket = TICKET_RE.search(text)
+        return Position(symbols[0], side.group(1).upper(), volume,
+                        ticket.group(1) if ticket else None)
+
+    def _extract_positions_from_xml(self, xml_text):
+        root = ET.fromstring(xml_text)
+        labels = [(n.attrib.get("text") or n.attrib.get("content-desc") or "").strip()
+                  for n in root.iter("node")]
+        if not any(SCREEN_MARKER in label.casefold() for label in labels):
+            raise RuntimeError("Positions screen marker absent; refusing to infer closures")
+
+        def rows(node):
+            children = list(node)
+            combined = " ".join([node.attrib.get("text", ""), node.attrib.get("content-desc", "")]
+                                + [label for child in children
+                                   for label in (child.attrib.get("text", ""),
+                                                 child.attrib.get("content-desc", ""))])
+            child_rows = [record for child in children for record in rows(child)]
+            if child_rows:
+                return child_rows
+            record = self._extract_single_record(combined)
+            return [record] if record else []
+        records = rows(root)
+        if not records and not any(EMPTY_MARKER in label.casefold() for label in labels):
+            raise RuntimeError("No parsed trades and no explicit empty-state label")
+        return records
+
+    @staticmethod
+    def _key(position):
+        return f"{position.ticket or ''}|{position.symbol}|{position.side}|{position.lot}"
+
+    def _reconcile(self, positions):
+        previous = self.state["positions"] if self.state else []
+        pools = defaultdict(deque)
+        for item in previous:
+            pools[item["key"]].append(item)
+        current = []
+        occurrences = defaultdict(int)
+        for position in positions:
+            key = self._key(position)
+            occurrence = occurrences[key]
+            occurrences[key] += 1
+            # Stable across a crash after appending, before saving the snapshot.
+            sequence = self.state["sequence"] + 1 if self.state else 0
+            item = pools[key].popleft() if pools[key] else {
+                "id": str(uuid.uuid5(uuid.NAMESPACE_URL,
+                                     f"puprime:{sequence}:{key}:{occurrence}")),
+                "key": key, **asdict(position)
+            }
+            current.append(item)
+        closes = [item for pool in pools.values() for item in pool if item.get("tracked", True)]
+        old_ids = {item["id"] for item in previous}
+        opens = [item for item in current if item["id"] not in old_ids]
+        return current, opens, closes
+
+    def observe(self, positions):
+        keys = tuple(sorted(self._key(p) for p in positions))
+        self.candidate_count = self.candidate_count + 1 if keys == self.candidate else 1
+        self.candidate = keys
+        if self.candidate_count < CONFIRM_POLLS:
+            return
+        current, opens, closes = self._reconcile(positions)
+        if self.state is None:
+            for item in current:
+                item["tracked"] = False
+            self.state = {"sequence": 0, "positions": current}
+            self._save_state(self.state)
+            logging.info("Initial snapshot saved without copying existing positions")
+            return
+        if not opens and not closes:
+            # Untracked baseline positions can disappear without a trade event.
+            if len(current) != len(self.state["positions"]):
+                next_state = {"sequence": self.state["sequence"], "positions": current}
+                self._save_state(next_state)
+                self.state = next_state
+            return
+        sequence = self.state["sequence"] + 1
+        timestamp = datetime.now(timezone.utc).isoformat()
+        events = [{"event": "CLOSE", "source_trade_id": item["id"], "symbol": item["symbol"],
+                   "side": item["side"], "lots": item["lot"]} for item in closes]
+        events += [{"event": "OPEN", "source_trade_id": item["id"], "symbol": item["symbol"],
+                    "side": item["side"], "lots": item["lot"]} for item in opens]
+        with EVENTS_PATH.open("a", encoding="utf-8", newline="\n") as handle:
+            for index, event in enumerate(events):
+                event.update(event_id=f"puprime:{sequence}:{index}", source="puprime",
+                             sl=None, tp=None, timestamp=timestamp)
+                handle.write(json.dumps(event, separators=(",", ":")) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        next_state = {"sequence": sequence, "positions": current}
+        self._save_state(next_state)
+        self.state = next_state
+        logging.info("Committed %d source events", len(events))
+
+    def run(self):
+        devices = self._run_adb(["devices"])
+        if devices.returncode or "\tdevice" not in devices.stdout:
+            raise RuntimeError("No connected ADB device; check the emulator")
         while True:
             try:
-                current_positions = self._read_live_positions()
-                self._emit_deltas(current_positions)
-            except Exception as exc:
-                logging.exception("Polling cycle failed: %s", exc)
+                self.observe(self._read_live_positions())
+            except (RuntimeError, ValueError, ET.ParseError, subprocess.TimeoutExpired):
+                self.candidate = None
+                self.candidate_count = 0
+                logging.exception("Invalid source snapshot; no trade signal emitted")
             time.sleep(POLL_SECONDS)
-
-    def _ensure_adb_connected(self) -> None:
-        result = self._run_adb(["devices"])
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"ADB is unavailable. Install Android platform-tools and ensure adb in PATH. stderr={result.stderr.strip()}"
-            )
-
-        if "\tdevice" not in result.stdout:
-            raise RuntimeError(
-                "No ADB device detected. Enable ADB for the emulator and verify `adb devices` shows one attached device."
-            )
-        logging.info("ADB connected device(s): %s", result.stdout.strip().replace("\n", " | "))
-
-    def _read_live_positions(self) -> Counter:
-        xml_text = self._dump_ui_xml()
-        positions = self._extract_positions_from_xml(xml_text)
-
-        # Fallback OCR when UI dump is missing/empty.
-        if not positions:
-            positions = self._extract_positions_from_screenshot()
-            if positions:
-                logging.info("Using OCR fallback for this cycle.")
-
-        return Counter((p.symbol, p.side, p.lot) for p in positions)
-
-    def _dump_ui_xml(self) -> str:
-        dump_result = self._run_adb(["shell", "uiautomator", "dump", ANDROID_DUMP_PATH])
-        if dump_result.returncode != 0:
-            raise RuntimeError(f"uiautomator dump failed: {dump_result.stderr.strip()}")
-
-        read_result = self._run_adb(["exec-out", "cat", ANDROID_DUMP_PATH])
-        if read_result.returncode != 0 or "<?xml" not in read_result.stdout:
-            raise RuntimeError(f"Unable to read UI XML: {read_result.stderr.strip()}")
-        return read_result.stdout
-
-    def _extract_positions_from_xml(self, xml_text: str) -> List[Position]:
-        root = ET.fromstring(xml_text)
-        chunks: List[str] = []
-
-        for node in root.iter("node"):
-            text = (node.attrib.get("text") or "").strip()
-            desc = (node.attrib.get("content-desc") or "").strip()
-            if text:
-                chunks.append(text)
-            if desc:
-                chunks.append(desc)
-
-        return self._extract_positions_from_texts(chunks)
-
-    def _extract_positions_from_screenshot(self) -> List[Position]:
-        if pytesseract is None:
-            return []
-
-        with tempfile.TemporaryDirectory() as td:
-            local_image = Path(td) / "screen.png"
-            with open(local_image, "wb") as f:
-                proc = subprocess.run(
-                    [ADB_PATH, "exec-out", "screencap", "-p"],
-                    stdout=f,
-                    stderr=subprocess.PIPE,
-                )
-            if proc.returncode != 0:
-                logging.warning("Screenshot fallback failed: %s", proc.stderr.decode(errors="ignore"))
-                return []
-
-            text = pytesseract.image_to_string(Image.open(local_image))
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        return self._extract_positions_from_texts(lines)
-
-    def _extract_positions_from_texts(self, texts: Iterable[str]) -> List[Position]:
-        records: List[Position] = []
-        joined = "\n".join(texts)
-
-        # 1) Parse line-by-line strings that already include symbol/side/lot.
-        for raw in list(texts):
-            rec = self._extract_single_record(raw)
-            if rec:
-                records.append(rec)
-
-        # 2) Parse multi-node combinations in proximity through sliding windows.
-        tokens = [t for t in re.split(r"[\n|,;]", joined) if t.strip()]
-        for idx in range(len(tokens)):
-            window_text = " ".join(tokens[idx : idx + 6])
-            rec = self._extract_single_record(window_text)
-            if rec:
-                records.append(rec)
-
-        unique = []
-        seen = set()
-        for r in records:
-            key = (r.symbol, r.side, r.lot)
-            if key not in seen:
-                seen.add(key)
-                unique.append(r)
-        return unique
-
-    def _extract_single_record(self, text: str) -> Optional[Position]:
-        symbol_match = SYMBOL_PATTERN.search(text.upper())
-        side_match = SIDE_PATTERN.search(text.upper())
-        lot_match = LOT_PATTERN.search(text)
-
-        if not (symbol_match and side_match and lot_match):
-            return None
-
-        symbol = symbol_match.group(1).upper()
-        side = side_match.group(1).upper()
-        lot = float(lot_match.group(1))
-
-        if lot <= 0:
-            return None
-
-        return Position(symbol=symbol, side=side, lot=lot)
-
-    def _emit_deltas(self, current: Counter) -> None:
-        opens = current - self.prev_positions
-        closes = self.prev_positions - current
-
-        for (symbol, side, lot), count in opens.items():
-            for _ in range(count):
-                self._write_signal(
-                    {
-                        "action": "OPEN",
-                        "symbol": symbol,
-                        "side": side,
-                        "lot": lot,
-                    }
-                )
-
-        for (symbol, _, _), count in closes.items():
-            for _ in range(count):
-                self._write_signal({"action": "CLOSE", "symbol": symbol})
-
-        self.prev_positions = current
-
-    def _write_signal(self, payload: Dict) -> None:
-        signature = json.dumps(payload, sort_keys=True)
-        now = time.time()
-
-        # Clean old entries.
-        self.recent_signals = {
-            sig: ts for sig, ts in self.recent_signals.items() if now - ts <= self.recent_ttl_seconds
-        }
-
-        if signature in self.recent_signals:
-            return
-
-        temp_path = SIGNAL_PATH.with_suffix(".tmp")
-        temp_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-        os.replace(temp_path, SIGNAL_PATH)
-
-        self.recent_signals[signature] = now
-        logging.info("Signal emitted: %s", payload)
-
-    def _run_adb(self, args: List[str]) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            [ADB_PATH, *args],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-        )
 
 
 if __name__ == "__main__":
-    bridge = SignalBridge()
-    bridge.run()
+    SignalBridge().run()
